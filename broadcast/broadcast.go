@@ -23,7 +23,7 @@ type BroadcastHandle struct {
 	mtu      uint
 }
 
-func NewBroadcastHandle(addr, id, streamID string, mtu uint) (*BroadcastHandle, error) {
+func NewBroadcastHandle(addr, id, streamID string, mtu uint, config webrtc.Configuration) (*BroadcastHandle, error) {
 	if mtu == 0 {
 		mtu = DEFAULT_MTU
 	}
@@ -46,7 +46,7 @@ func NewBroadcastHandle(addr, id, streamID string, mtu uint) (*BroadcastHandle, 
 				return true
 			},
 		},
-		config:   webrtc.Configuration{},
+		config:   config,
 		id:       id,
 		streamID: streamID,
 		mtu:      mtu,
