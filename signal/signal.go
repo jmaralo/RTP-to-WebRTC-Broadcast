@@ -23,34 +23,43 @@ func NewSignalHandle(conn *websocket.Conn) *SignalHandle {
 	}
 }
 
-func (sh *SignalHandle) Send(message Message) error {
-	sh.peerMx.Lock()
-	defer sh.peerMx.Unlock()
-	return sh.peer.WriteJSON(message)
+func (handle *SignalHandle) Send(message Message) error {
+	handle.peerMx.Lock()
+	defer handle.peerMx.Unlock()
+	return handle.peer.WriteJSON(message)
 }
 
-func (sh *SignalHandle) Listen() {
+func (handle *SignalHandle) SendMessage(event string, payload any) error {
+	message, err := NewMessage(event, payload)
+	if err != nil {
+		return err
+	}
+
+	return handle.Send(*message)
+}
+
+func (handle *SignalHandle) Listen() {
 	var msg = new(Message)
 	for {
-		if err := sh.peer.ReadJSON(msg); err != nil {
+		if err := handle.peer.ReadJSON(msg); err != nil {
 			log.Println(err)
 			return
 		}
 
-		if action, exists := sh.events.Get(msg.Type); exists {
+		if action, ok := handle.events.Get(msg.Event); ok {
 			action(msg.Payload)
 		}
 	}
 }
 
-func (sh *SignalHandle) Close() error {
-	return sh.peer.Close()
+func (handle *SignalHandle) Close() error {
+	return handle.peer.Close()
 }
 
-func (sh *SignalHandle) SetEvent(key string, value func(json.RawMessage)) {
-	sh.events.Set(key, value)
+func (handle *SignalHandle) SetEvent(key string, value func(json.RawMessage)) {
+	handle.events.Set(key, value)
 }
 
-func (sh *SignalHandle) UnsetEvent(key string) {
-	sh.events.Del(key)
+func (handle *SignalHandle) UnsetEvent(key string) {
+	handle.events.Del(key)
 }

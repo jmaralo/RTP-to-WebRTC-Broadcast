@@ -1,6 +1,8 @@
 package common
 
-import "sync"
+import (
+	"sync"
+)
 
 type SyncMap[K comparable, V any] struct {
 	mutex *sync.Mutex
