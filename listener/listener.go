@@ -5,11 +5,11 @@ import (
 	"net"
 
 	"github.com/google/uuid"
-	"github.com/jmaralo/rtp-to-webrtc-broadcast/common"
+	"github.com/jmaralo/webrtc-broadcast/common"
 )
 
 // Small buffer for data channel, this prevents duplicate and unordered payloads
-const CHANNEL_BUFFER = 1024
+const CHANNEL_BUFFER = 100
 
 type RTPListener struct {
 	stream  *net.UDPConn
@@ -49,8 +49,10 @@ func (listener *RTPListener) broadcast(mtu int) {
 		}
 
 		listener.clients.ForEach(func(id string, stream chan<- []byte) {
+			data := make([]byte, n)
+			copy(data, buf)
 			select {
-			case stream <- buf[:n]:
+			case stream <- data:
 			default:
 			}
 		})

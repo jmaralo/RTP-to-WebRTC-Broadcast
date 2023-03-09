@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/jmaralo/rtp-to-webrtc-broadcast/connection"
-	"github.com/jmaralo/rtp-to-webrtc-broadcast/listener"
-	websocket_handle "github.com/jmaralo/rtp-to-webrtc-broadcast/websocket"
+	"github.com/jmaralo/webrtc-broadcast/connection"
+	"github.com/jmaralo/webrtc-broadcast/listener"
+	websocket_handle "github.com/jmaralo/webrtc-broadcast/websocket"
 	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v3"
 )
@@ -20,7 +20,7 @@ var trackID = flag.String("tid", "rtp", "The ID that identifies the video track"
 var streamID = flag.String("sid", "video", "The ID that identifies the video stream")
 var mtu = flag.Int("mtu", 1500, "The MTU of the interface where the RTP stream is received")
 var config = flag.String("config", "./config.json", "Configuration file for the Peers")
-var signalURL = flag.String("o", "127.0.0.1:2345", "URL to signal the connection, the actual endpoint ws://<signal url>/signal")
+var signalURL = flag.String("o", "192.168.0.2:4040", "URL to signal the connection, the actual endpoint ws://<signal url>/signal")
 var peerLimit = flag.Int("p", 15, "max amout of peers that can connect at once")
 
 func main() {
@@ -48,12 +48,8 @@ func main() {
 
 	interceptorRegistry := interceptor.Registry{}
 
-	if err := webrtc.ConfigureRTCPReports(&interceptorRegistry); err != nil {
-		log.Fatalf("ConfigureRTCPReports: %s\n", err)
-	}
-
-	if err := webrtc.ConfigureTWCCSender(&mediaEngine, &interceptorRegistry); err != nil {
-		log.Fatalf("ConfigureTWCCSender: %s\n", err)
+	if err := webrtc.RegisterDefaultInterceptors(&mediaEngine, &interceptorRegistry); err != nil {
+		log.Fatalf("RegisterDefaultInterceptors: %s\n", err)
 	}
 
 	webrtcAPI := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngine), webrtc.WithInterceptorRegistry(&interceptorRegistry))

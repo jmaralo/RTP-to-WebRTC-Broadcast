@@ -3,9 +3,9 @@ package connection
 import (
 	"log"
 
-	"github.com/jmaralo/rtp-to-webrtc-broadcast/common"
-	"github.com/jmaralo/rtp-to-webrtc-broadcast/listener"
-	"github.com/jmaralo/rtp-to-webrtc-broadcast/signal"
+	"github.com/jmaralo/webrtc-broadcast/common"
+	"github.com/jmaralo/webrtc-broadcast/listener"
+	"github.com/jmaralo/webrtc-broadcast/signal"
 )
 
 type ConnectionHandle struct {
@@ -31,6 +31,7 @@ func NewConnectionHandle(listener *listener.RTPListener, maxPeers int, data *Pee
 }
 
 func (handle *ConnectionHandle) AddPeer(conn *signal.SignalHandle) {
+	log.Println("clients:", handle.peers.Len()+1)
 	if handle.peers.Len() >= handle.maxPeers {
 		conn.SendMessage("close", "max peers exceeded")
 		return
@@ -39,7 +40,7 @@ func (handle *ConnectionHandle) AddPeer(conn *signal.SignalHandle) {
 	id, stream := handle.listener.NewClient()
 
 	handle.peerData.SetID(id)
-	peer, err := newRemotePeer(conn, stream, handle.closeChan, handle.peerData)
+	peer, err := newRemotePeer(conn, stream, handle.closeChan, *handle.peerData)
 	if err != nil {
 		log.Printf("ConnectionHandle: AddPeer: %s\n", err)
 		return
@@ -56,7 +57,7 @@ func (handle *ConnectionHandle) RemovePeer(id string) {
 func (handle *ConnectionHandle) listenClose() {
 	for {
 		remove := <-handle.closeChan
-		log.Println("remove", remove)
+		log.Println("Remove Peer:", remove)
 		handle.RemovePeer(remove)
 	}
 }

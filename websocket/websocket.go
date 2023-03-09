@@ -5,7 +5,7 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
-	"github.com/jmaralo/rtp-to-webrtc-broadcast/signal"
+	"github.com/jmaralo/webrtc-broadcast/signal"
 )
 
 type WebsocketHandle struct {

@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
-	"github.com/jmaralo/rtp-to-webrtc-broadcast/common"
+	"github.com/jmaralo/webrtc-broadcast/common"
 )
 
 type SignalHandle struct {
