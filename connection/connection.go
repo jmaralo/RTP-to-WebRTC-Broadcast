@@ -2,6 +2,9 @@ package connection
 
 import (
 	"log"
+	"os"
+
+	osSignal "os/signal"
 
 	"github.com/jmaralo/webrtc-broadcast/common"
 	"github.com/jmaralo/webrtc-broadcast/listener"
@@ -27,13 +30,21 @@ func NewConnectionHandle(listener *listener.RTPListener, maxPeers int, data *Pee
 
 	go handle.listenClose()
 
+	interruptNotification := make(chan os.Signal, 1)
+	go func(notification <-chan os.Signal) {
+		<-notification
+		handle.CloseAll()
+		os.Exit(0)
+	}(interruptNotification)
+	osSignal.Notify(interruptNotification, os.Interrupt)
+
 	return handle
 }
 
 func (handle *ConnectionHandle) AddPeer(conn *signal.SignalHandle) {
 	log.Println("clients:", handle.peers.Len()+1)
 	if handle.peers.Len() >= handle.maxPeers {
-		conn.SendMessage("close", "max peers exceeded")
+		conn.Close(120, "capacity full")
 		return
 	}
 
@@ -60,4 +71,14 @@ func (handle *ConnectionHandle) listenClose() {
 		log.Println("Remove Peer:", remove)
 		handle.RemovePeer(remove)
 	}
+}
+
+func (handle *ConnectionHandle) CloseAll() {
+	handle.peers.ForEach(func(id string, peer *RemotePeer) {
+		peer.Leave("going away")
+		select {
+		case handle.closeChan <- id:
+		default:
+		}
+	})
 }

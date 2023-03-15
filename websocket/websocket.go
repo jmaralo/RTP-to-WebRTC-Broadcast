@@ -3,6 +3,7 @@ package websocket_handle
 import (
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/jmaralo/webrtc-broadcast/signal"
@@ -29,5 +30,9 @@ func (handle *WebsocketHandle) ServeHTTP(writer http.ResponseWriter, request *ht
 		log.Printf("WebsocketHandle: ServeHTTP: %s\n", err)
 		return
 	}
-	handle.onConnection(signal.NewSignalHandle(conn))
+	handle.onConnection(signal.NewSignalHandle(conn, signal.HandleConfiguration{
+		KeepaliveTimeout:     time.Second * 5,
+		HandshakeTimeout:     time.Second * 5,
+		MaxPendingKeepalives: 3,
+	}))
 }

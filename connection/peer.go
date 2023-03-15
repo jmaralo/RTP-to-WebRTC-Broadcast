@@ -18,8 +18,14 @@ type RemotePeer struct {
 }
 
 func newRemotePeer(sig *signal.SignalHandle, stream <-chan []byte, close chan<- string, data PeerData) (*RemotePeer, error) {
-	log.Println("New Peer")
+	log.Println("New Peer Joined:", data.id)
 	peer, err := data.api.NewPeerConnection(data.config)
+
+	if err != nil {
+		sig.Close(300, err.Error())
+		return nil, err
+	}
+
 	remotePeer := &RemotePeer{
 		signal: sig,
 		peer:   peer,
@@ -29,16 +35,10 @@ func newRemotePeer(sig *signal.SignalHandle, stream <-chan []byte, close chan<- 
 		data:   data,
 	}
 
-	if err != nil {
-		remotePeer.Close("failed to create peer connection")
-		return nil, err
-	}
-
-	remotePeer.signal.SetEvent("offer", remotePeer.onSignalOffer)
-	remotePeer.signal.SetEvent("reject", remotePeer.onSignalReject)
-	remotePeer.signal.SetEvent("close", remotePeer.onSignalClose)
-	remotePeer.signal.SetEvent("answer", remotePeer.onSignalAnswer)
-	remotePeer.signal.SetEvent("candidate", remotePeer.onSignalCandidate)
+	remotePeer.signal.AddEventListener("offer", remotePeer.onSignalOffer)
+	remotePeer.signal.AddEventListener("close", remotePeer.onSignalClose)
+	remotePeer.signal.AddEventListener("answer", remotePeer.onSignalAnswer)
+	remotePeer.signal.AddEventListener("candidate", remotePeer.onSignalCandidate)
 
 	remotePeer.peer.OnICECandidate(remotePeer.onICECandidate)
 	remotePeer.peer.OnConnectionStateChange(remotePeer.onConnectionStateChange)
@@ -50,50 +50,46 @@ func newRemotePeer(sig *signal.SignalHandle, stream <-chan []byte, close chan<- 
 	return remotePeer, nil
 }
 
-func (peer *RemotePeer) onSignalOffer(msg json.RawMessage) {
-	offer := new(string)
-	if err := json.Unmarshal(msg, offer); err != nil {
+func (peer *RemotePeer) onSignalOffer(msg signal.Message) {
+	offer := new(webrtc.SessionDescription)
+	if err := json.Unmarshal(msg.Payload, offer); err != nil {
 		log.Printf("RemotePeer: onOffer: Unmarshal: %s\n", err)
+		peer.signal.Reject(210, msg, err.Error())
+		return
 	}
 
-	err := peer.peer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: *offer})
+	err := peer.peer.SetRemoteDescription(*offer)
 	if err != nil {
 		log.Printf("RemotePeer: onOffer: SetRemoteDescription: %s\n", err)
-		peer.signal.SendMessage("reject", "invalid offer")
-		peer.Close("failed to parse offer")
+		peer.signal.Reject(320, msg, err.Error())
+		return
 	}
 
 	peer.sendAnswer()
 }
 
-func (peer *RemotePeer) onSignalReject(msg json.RawMessage) {
-	log.Printf("Peer rejected signal with message %s\n", string(msg))
+func (peer *RemotePeer) onSignalAnswer(msg signal.Message) {
+	peer.signal.Reject(110, msg, "server is not awaiting an answer")
 }
 
-func (peer *RemotePeer) onSignalClose(msg json.RawMessage) {
-	log.Printf("Remote peer requested close with message: %s\n", string(msg))
-	peer.Close("ok")
-}
-
-func (peer *RemotePeer) onSignalAnswer(msg json.RawMessage) {
-	peer.signal.SendMessage("reject", "not expecting answer")
-}
-
-func (peer *RemotePeer) onSignalCandidate(msg json.RawMessage) {
+func (peer *RemotePeer) onSignalCandidate(msg signal.Message) {
 	candidate := new(webrtc.ICECandidateInit)
-	if err := json.Unmarshal(msg, candidate); err != nil {
+	if err := json.Unmarshal(msg.Payload, candidate); err != nil {
 		log.Printf("RemotePeer: onCandidate: Unmarshal: %s\n", err)
-		peer.signal.SendMessage("reject", "invalid candidate")
-		peer.Close("failed to parse candidate")
+		peer.signal.Reject(230, msg, err.Error())
 		return
 	}
 
 	err := peer.peer.AddICECandidate(*candidate)
 	if err != nil {
 		log.Printf("RemotePeer: onCandidate: AddICECandidate: %s\n", err)
-		peer.Close("failed to add candidate")
+		peer.signal.Reject(330, msg, err.Error())
 		return
 	}
+}
+
+func (peer *RemotePeer) onSignalClose(msg signal.Message) {
+	peer.Close()
 }
 
 func (peer *RemotePeer) onICECandidate(candidate *webrtc.ICECandidate) {
@@ -102,7 +98,7 @@ func (peer *RemotePeer) onICECandidate(candidate *webrtc.ICECandidate) {
 	}
 
 	if err := peer.signal.SendMessage("candidate", candidate.ToJSON()); err != nil {
-		peer.Close("failed to send candidate")
+		log.Printf("RemotePeer: onICECandidate: SendMessage: %s\n", err)
 		return
 	}
 }
@@ -110,10 +106,9 @@ func (peer *RemotePeer) onICECandidate(candidate *webrtc.ICECandidate) {
 func (peer *RemotePeer) onConnectionStateChange(state webrtc.PeerConnectionState) {
 	switch state {
 	case webrtc.PeerConnectionStateConnected:
-		if !peer.data.running && state == webrtc.PeerConnectionStateConnected {
-			log.Println("peer", peer.data.id, "run")
-			go peer.run()
-		}
+		log.Println("Peer finished handshake:", peer.data.id)
+		peer.signal.FinishHandshake()
+		go peer.run()
 	default:
 	}
 }
@@ -121,20 +116,18 @@ func (peer *RemotePeer) onConnectionStateChange(state webrtc.PeerConnectionState
 func (peer *RemotePeer) run() {
 	peer.data.running = true
 	defer func() { peer.data.running = false }()
-	for peer.track == nil {
-	}
 
 	for {
 		data, ok := <-peer.stream
 		if !ok {
 			log.Println("RemotePeer: run: channel closed")
-			peer.Close("failed to read stream")
+			peer.signal.Close(300, "no stream detected")
 			return
 		}
 
 		if _, err := peer.track.Write(data); err != nil {
 			log.Printf("RemotePeer: run: Write: %s\n", err)
-			peer.Close("failed to write track")
+			peer.signal.Close(300, err.Error())
 			return
 		}
 	}
@@ -144,7 +137,7 @@ func (peer *RemotePeer) addTrack() {
 	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, peer.data.trackID, peer.data.streamID)
 	if err != nil {
 		log.Printf("RemotePeer: addTrack: NewTrackLocalStaticRTP: %s\n", err)
-		peer.Close("failed to create track")
+		peer.signal.Close(300, err.Error())
 		return
 	}
 
@@ -152,7 +145,7 @@ func (peer *RemotePeer) addTrack() {
 	rtpSender, err := peer.peer.AddTrack(track)
 	if err != nil {
 		log.Printf("RemotePeer: addTrack: AddTrack: %s\n", err)
-		peer.Close("failed to add track")
+		peer.signal.Close(300, err.Error())
 		return
 	}
 
@@ -171,32 +164,27 @@ func (peer *RemotePeer) sendAnswer() {
 	answer, err := peer.peer.CreateAnswer(nil)
 	if err != nil {
 		log.Printf("RemotePeer: sendAnswer: CreateAnswer: %s\n", err)
-		peer.Close("failed to create answer")
+		peer.signal.Close(341, err.Error())
 	}
 
 	err = peer.peer.SetLocalDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.SDP})
 	if err != nil {
 		log.Printf("RemotePeer: sendAnswer: SetLocalDescription: %s\n", err)
-		peer.Close("failed to set answer")
+		peer.signal.Close(311, err.Error())
 	}
 
-	err = peer.signal.SendMessage("answer", answer.SDP)
+	err = peer.signal.SendMessage("answer", answer)
 	if err != nil {
 		log.Printf("RemotePeer: sendAnswer: SendMessage: %s\n", err)
-		peer.Close("failed to send answer")
+		peer.signal.Close(300, err.Error())
 	}
 }
 
-func (peer *RemotePeer) Close(reason string) {
-	log.Println("Close Peer")
-	if peer.data.closed {
-		return
-	}
-
-	log.Printf("Closing peer connection, reason: %s\n", reason)
-	peer.signal.SendMessage("close", reason)
-	peer.signal.Close()
+func (peer *RemotePeer) Close() {
 	peer.peer.Close()
 	peer.close <- peer.data.id
-	peer.data.closed = true
+}
+
+func (peer *RemotePeer) Leave(reason string) error {
+	return peer.signal.Close(100, reason)
 }
