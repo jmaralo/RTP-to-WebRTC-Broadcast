@@ -1,84 +1,40 @@
 package connection
 
 import (
+	"fmt"
 	"log"
-	"os"
+	"net/http"
 
-	osSignal "os/signal"
-
-	"github.com/jmaralo/webrtc-broadcast/common"
-	"github.com/jmaralo/webrtc-broadcast/listener"
-	"github.com/jmaralo/webrtc-broadcast/signal"
+	"github.com/gorilla/websocket"
+	"github.com/jmaralo/webrtc-broadcast/peer"
 )
 
-type ConnectionHandle struct {
-	peers     *common.SyncMap[string, *RemotePeer]
-	listener  *listener.RTPListener
-	peerData  *PeerData
-	maxPeers  int
-	closeChan chan string
+type WebSocketHandle struct {
+	upgrader *websocket.Upgrader
 }
 
-func NewConnectionHandle(listener *listener.RTPListener, maxPeers int, data *PeerData) *ConnectionHandle {
-	handle := &ConnectionHandle{
-		peers:     common.NewSyncMap[string, *RemotePeer](),
-		listener:  listener,
-		peerData:  data,
-		maxPeers:  maxPeers,
-		closeChan: make(chan string),
+func New() *WebSocketHandle {
+	return &WebSocketHandle{
+		upgrader: &websocket.Upgrader{
+			CheckOrigin: func(*http.Request) bool { return true },
+		},
 	}
-
-	go handle.listenClose()
-
-	interruptNotification := make(chan os.Signal, 1)
-	go func(notification <-chan os.Signal) {
-		<-notification
-		handle.CloseAll()
-		os.Exit(0)
-	}(interruptNotification)
-	osSignal.Notify(interruptNotification, os.Interrupt)
-
-	return handle
 }
 
-func (handle *ConnectionHandle) AddPeer(conn *signal.SignalHandle) {
-	log.Println("clients:", handle.peers.Len()+1)
-	if handle.peers.Len() >= handle.maxPeers {
-		conn.Close(120, "capacity full")
-		return
-	}
+func (handle *WebSocketHandle) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	defer request.Body.Close()
+	log.Println("[DEBUG] New WebSocket connection")
 
-	id, stream := handle.listener.NewClient()
-
-	handle.peerData.SetID(id)
-	peer, err := newRemotePeer(conn, stream, handle.closeChan, *handle.peerData)
+	conn, err := handle.upgrader.Upgrade(writer, request, nil)
 	if err != nil {
-		log.Printf("ConnectionHandle: AddPeer: %s\n", err)
+		log.Printf("[ERROR] WebSocketHandle: ServeHTTP: Upgrade: %s\n", err)
 		return
 	}
 
-	handle.peers.Set(id, peer)
-}
-
-func (handle *ConnectionHandle) RemovePeer(id string) {
-	handle.listener.RemoveClient(id)
-	handle.peers.Del(id)
-}
-
-func (handle *ConnectionHandle) listenClose() {
-	for {
-		remove := <-handle.closeChan
-		log.Println("Remove Peer:", remove)
-		handle.RemovePeer(remove)
+	remote, err := peer.New(conn)
+	if err != nil {
+		log.Printf("[ERROR] WebSocketHandle: ServeHTTP: peer.New: %s\n", err)
 	}
-}
 
-func (handle *ConnectionHandle) CloseAll() {
-	handle.peers.ForEach(func(id string, peer *RemotePeer) {
-		peer.Leave("going away")
-		select {
-		case handle.closeChan <- id:
-		default:
-		}
-	})
+	fmt.Println(remote)
 }
