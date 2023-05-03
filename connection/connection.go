@@ -1,73 +1,141 @@
 package connection
 
+// TODO: limit max connections
+
 import (
 	"net/http"
+	"sync"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/jmaralo/webrtc-broadcast/remote"
+	"github.com/jmaralo/webrtc-broadcast/channel"
+	"github.com/jmaralo/webrtc-broadcast/peer"
+	"github.com/jmaralo/webrtc-broadcast/stream"
 	"github.com/pion/webrtc/v3"
-	"github.com/pkg/errors"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
-// ConnectionHandle manages the remote peer connections
-type ConnectionHandle struct {
-	maxPeers int
-	upgrader *websocket.Upgrader
-	log      zerolog.Logger
+type Manager struct {
+	streams      map[uuid.UUID]*stream.Stream
+	upgrader     *websocket.Upgrader
+	remotesMx    *sync.Mutex
+	remotes      map[uuid.UUID]*peer.Remote
+	signalConfig channel.Config
+	peerConfig   peer.Config
+	onTrack      func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
+	maxConns     int
 }
 
-// New creates a new connection handle
-func New(maxPeers int) *ConnectionHandle {
-	return &ConnectionHandle{
-		maxPeers: maxPeers,
+func NewManager(peerConfig peer.Config, signalConfig channel.Config, onTrack func(*webrtc.TrackRemote, *webrtc.RTPReceiver), maxConns int) *Manager {
+	return &Manager{
+		streams: make(map[uuid.UUID]*stream.Stream),
 		upgrader: &websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true
-			},
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin:     func(r *http.Request) bool { return true },
 		},
-		log: log.With().Logger(),
+		remotesMx:    &sync.Mutex{},
+		remotes:      make(map[uuid.UUID]*peer.Remote),
+		signalConfig: signalConfig,
+		peerConfig:   peerConfig,
+		onTrack:      onTrack,
+		maxConns:     maxConns,
 	}
 }
 
-// ServeHTTP handles the HTTP requests and upgrades them to websockets
-func (handle *ConnectionHandle) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+func (manager *Manager) ServeHTTP(writter http.ResponseWriter, request *http.Request) {
 	defer request.Body.Close()
-	handle.log.Debug().Msg("New connection")
 
-	if remote.ConnectedPeers > handle.maxPeers {
-		http.Error(writer, "Too many peers", http.StatusForbidden)
+	if manager.remotesLen() >= manager.maxConns {
+		http.Error(writter, "max connections reached", http.StatusServiceUnavailable)
 		return
 	}
 
-	// set CORS headers
-	writer.Header().Set("Access-Control-Allow-Origin", "*")
-
-	conn, err := handle.upgrader.Upgrade(writer, request, nil)
+	conn, err := manager.upgrader.Upgrade(writter, request, nil)
 	if err != nil {
-		handle.log.Error().Err(err).Msg("Error upgrading connection")
 		return
 	}
 
-	err = handle.addRemote(conn)
+	signal := channel.New(conn, manager.signalConfig)
+
+	remote, err := peer.New(signal, manager.onTrack, manager.peerConfig)
 	if err != nil {
-		conn.Close()
-		handle.log.Error().Err(err).Msg("Error adding remote")
 		return
 	}
 
-	handle.log.Warn().Int("current", remote.ConnectedPeers).Int("max", handle.maxPeers).Msg("Connected peers")
+	for id, stream := range manager.streams {
+		err := remote.AddTrack(id, stream.Track())
+		if err != nil {
+			remote.Close()
+			return
+		}
+	}
+
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return
+	}
+
+	manager.addRemote(id, remote)
 }
 
-// addRemote creates a new remote peer and adds it to the list of remotes
-func (handle *ConnectionHandle) addRemote(conn *websocket.Conn) error {
-	// TODO: remove hardcoded configuration
-	_, err := remote.New(conn, false, webrtc.Configuration{})
+func (manager *Manager) remotesLen() int {
+	manager.remotesMx.Lock()
+	defer manager.remotesMx.Unlock()
+
+	return len(manager.remotes)
+}
+
+func (manager *Manager) addRemote(id uuid.UUID, remote *peer.Remote) {
+	manager.remotesMx.Lock()
+	defer manager.remotesMx.Unlock()
+
+	manager.remotes[id] = remote
+	go manager.consumeRemoteErr(id, remote)
+	log.Info().Int("connections", len(manager.remotes)).Msg("new connection")
+}
+
+func (manager *Manager) consumeRemoteErr(id uuid.UUID, remote *peer.Remote) {
+	for range remote.Errors {
+		manager.removeRemote(id)
+	}
+}
+
+func (manager *Manager) removeRemote(id uuid.UUID) {
+	manager.remotesMx.Lock()
+	defer manager.remotesMx.Unlock()
+
+	delete(manager.remotes, id)
+	log.Info().Int("connections", len(manager.remotes)).Msg("connection closed")
+}
+
+func (manager *Manager) AddStream(stream *stream.Stream) error {
+	id, err := uuid.NewRandom()
 	if err != nil {
-		return errors.Wrap(err, "addRemote")
+		return err
 	}
 
-	handle.log.Info().Msg("New remote added")
-	return nil
+	manager.streams[id] = stream
+	go manager.consumeStreamErr(id, stream)
+
+	for _, remote := range manager.remotes {
+		remoteErr := remote.AddTrack(id, stream.Track())
+		if remoteErr != nil {
+			err = remoteErr
+		}
+	}
+
+	return err
+}
+
+func (manager *Manager) consumeStreamErr(id uuid.UUID, stream *stream.Stream) {
+	for range stream.Errors {
+		manager.removeStream(id)
+	}
+}
+
+func (manager *Manager) removeStream(id uuid.UUID) {
+	for _, remote := range manager.remotes {
+		remote.RemoveTrack(id)
+	}
 }

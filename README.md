@@ -1,8 +1,8 @@
 # RTP to WebRTC (broadcast)
 
-Small utility to broadcast an RTP stream to multiple peers with WebRTC
+Small utility to broadcast multiple RTP streams to multiple peers with WebRTC
 
-# Usage
+## Usage
 
 Download the latest release and run the binary or build from source using `go build`.
 

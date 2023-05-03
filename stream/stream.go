@@ -2,105 +2,81 @@ package stream
 
 import (
 	"net"
-	"sync"
 
-	"github.com/google/uuid"
 	"github.com/pion/webrtc/v3"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
-// TODO: remove hardcoded value
-const (
-	// READ_BUFFER_SIZE is the size of the read buffer
-	READ_BUFFER_SIZE = 1500
-)
-
-// Stream reads and broadcast an UDP stream
 type Stream struct {
-	conn *net.UDPConn
-	// observerMx is used to protect the observers map from concurrent access
-	observersMx *sync.Mutex
-	observers   map[uuid.UUID]chan<- []byte
+	Errors    <-chan error
+	errorChan chan<- error
 
-	codec webrtc.RTPCodecCapability
-	id    string
-	label string
+	stopChan chan struct{}
 
-	log zerolog.Logger
+	track  *webrtc.TrackLocalStaticRTP
+	conn   *net.UDPConn
+	config Config
 }
 
-// new creates a new stream
-func new(conn *net.UDPConn, codec webrtc.RTPCodecCapability, id string, label string) *Stream {
-	stream := &Stream{
-		conn:        conn,
-		observersMx: &sync.Mutex{},
-		observers:   make(map[uuid.UUID]chan<- []byte),
-		codec:       codec,
-		id:          id,
-		label:       label,
-		log:         log.With().Str("streamID", id).Str("streamLabel", label).Logger(),
+func New(conn *net.UDPConn, config Config) (*Stream, error) {
+	log.Info().Str("raddr", conn.LocalAddr().String()).Msg("new stream")
+	track, err := webrtc.NewTrackLocalStaticRTP(config.Codec, config.Id, config.StreamID)
+	if err != nil {
+		return nil, err
 	}
 
-	go stream.listen()
+	errorChan := make(chan error, 1)
 
-	return stream
+	stream := &Stream{
+		Errors:    errorChan,
+		errorChan: errorChan,
+
+		stopChan: make(chan struct{}),
+
+		track:  track,
+		conn:   conn,
+		config: config,
+	}
+
+	go stream.listen(config.Mtu)
+
+	return stream, nil
 }
 
-// listen listens for incoming data
-// the data readed from the udp connection is copied and broadcasted to all the observers
-func (stream *Stream) listen() {
-	stream.log.Debug().Msg("stream listening")
-	readBuffer := make([]byte, READ_BUFFER_SIZE)
+func (stream *Stream) Track() *webrtc.TrackLocalStaticRTP {
+	return stream.track
+}
+
+func (stream *Stream) listen(mtu int) {
+	log.Debug().Msg("stream listening")
+	defer log.Debug().Msg("stream stopped listening")
+	defer stream.conn.Close()
+
 	for {
-		n, err := stream.conn.Read(readBuffer)
+		buffer := make([]byte, mtu)
+		n, err := stream.conn.Read(buffer)
 		if err != nil {
-			stream.close()
-			stream.log.Error().Err(err).Msg("stream closed")
+			log.Error().Err(err).Msg("failed to read from conn")
+			stream.errorChan <- err
 			return
 		}
 
-		stream.broadcast(readBuffer[:n])
-	}
-}
+		log.Trace().Msg("writing to track")
+		if _, err := stream.track.Write(buffer[:n]); err != nil {
+			log.Error().Err(err).Msg("failed to write to track")
+			stream.errorChan <- err
+			return
+		}
 
-// broadcast broadcasts the data to all the observers
-// it first copies the data to avoid passing the same slice to all the observers by reference
-// this method should not block on read when broadcasting to the observers
-func (stream *Stream) broadcast(data []byte) {
-	stream.observersMx.Lock()
-	defer stream.observersMx.Unlock()
-
-	for id, observer := range stream.observers {
-		dataCopy := make([]byte, len(data))
-		copy(dataCopy, data)
-
-		if !sendBlocking(dataCopy, observer) {
-			stream.log.Trace().Str("id", id.String()).Msg("observer channel full")
+		select {
+		case <-stream.stopChan:
+			log.Trace().Msg("cancel listen received")
+			return
+		default:
 		}
 	}
 }
 
-// sendNonBlocking sends data through a channel without blocking
-// it returns true if the data was sent and false if the channel is full
-func sendNonBlocking(data []byte, channel chan<- []byte) bool {
-	select {
-	case channel <- data:
-		return true
-	default:
-		return false
-	}
-}
-
-// sendBlocking sends data through a channel blocking until the data is sent
-func sendBlocking(data []byte, channel chan<- []byte) bool {
-	channel <- data
-	return true
-}
-
-// close closes the stream
-func (stream *Stream) close() error {
-	stream.log.Warn().Msg("closing stream")
-	stream.closeAllObservers()
-	return stream.conn.Close()
+func (stream *Stream) Stop() {
+	stream.stopChan <- struct{}{}
 }

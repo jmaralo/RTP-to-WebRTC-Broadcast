@@ -3,44 +3,106 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/gorilla/websocket"
+	"github.com/jmaralo/webrtc-broadcast/channel"
 	"github.com/jmaralo/webrtc-broadcast/connection"
+	"github.com/jmaralo/webrtc-broadcast/peer"
 	"github.com/jmaralo/webrtc-broadcast/stream"
+	"github.com/pion/webrtc/v3"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/rs/zerolog/pkgerrors"
 )
 
-var streamURLs = flag.String("i", "192.168.0.2:6969,192.168.0.2:6970,192.168.0.2:6971", "URL for the RTP stream")
-var signalURL = flag.String("o", "192.168.0.2:4040", "URL to signal the connection, the actual endpoint ws://<signal url>/signal")
-var logLevel = flag.String("logLevel", "info", "Log level to use")
-var maxPeers = flag.Int("maxPeers", 10, "Maximum number of peers to allow")
+var streamsAddr = flag.String("i", "192.168.0.9:9090,192.168.0.9:9091,192.168.0.9:9092", "comma separated list of RTP streams")
+var localAddr = flag.String("o", "192.168.0.9:4040", "address to listen on")
+var maxPeers = flag.Uint("p", 300, "maximum number of peers")
+var logLevel = flag.String("l", "info", "logging level")
+var pingInterval = flag.Duration("ping", time.Second*5, "ping interval")
+var disconnectTimeout = flag.Duration("disconnect", time.Second*10, "disconnect timeout")
+var mtu = flag.Int("mtu", 1500, "MTU")
 
 func main() {
 	flag.Parse()
 	initLogger()
 
-	err := stream.Init(strings.Split(*streamURLs, ","))
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to initialize streams")
-		return
+	manager := connection.NewManager(peer.Config{
+		OfferOptions:  webrtc.OfferOptions{},
+		AnswerOptions: webrtc.AnswerOptions{},
+		Mtu:           *mtu,
+	}, channel.Config{
+		ReadBuffer:        100,
+		WriteBuffer:       100,
+		DataType:          websocket.TextMessage,
+		PingInterval:      *pingInterval,
+		MaxPendingPings:   3,
+		DisconnectTimeout: *disconnectTimeout,
+	}, consumeTrack, int(*maxPeers))
+
+	addrs := strings.Split(*streamsAddr, ",")
+	conns := make([]*net.UDPConn, len(addrs))
+	for i, addr := range addrs {
+		raddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to resolve UDP address")
+		}
+		conn, err := net.ListenUDP("udp", raddr)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to listen on UDP address")
+		}
+		conns[i] = conn
 	}
-	defer stream.Get().Close()
-	log.Info().Str("addrs", *streamURLs).Msg("Streams initialized")
 
-	connectionHandle := connection.New(*maxPeers)
-	log.Info().Msg("Connection handle initialized")
+	for i, conn := range conns {
+		stream, err := stream.New(conn, stream.Config{
+			Codec: webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeH264,
+				ClockRate: 90000,
+			},
+			Id:       fmt.Sprint(i),
+			StreamID: fmt.Sprint(i),
+			Mtu:      *mtu,
+		})
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to create stream")
+		}
+		manager.AddStream(stream)
+	}
 
-	http.Handle("/", connectionHandle)
-	log.Info().Str("addr", fmt.Sprintf("ws://%s", *signalURL)).Msg("Listening for connections")
-	err = http.ListenAndServe(*signalURL, nil)
-	if err != nil {
-		log.Fatal().Err(err).Msg("Failed to start server")
-		return
+	http.Handle("/", manager)
+	log.Info().Str("addr", *localAddr).Msg("listening")
+	http.ListenAndServe(*localAddr, nil)
+}
+
+func consumeTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	go consumeReceiver(receiver)
+	go consumeTrackRemote(track)
+}
+
+func consumeReceiver(receiver *webrtc.RTPReceiver) {
+	for {
+		_, _, err := receiver.Read(make([]byte, 1500))
+		if err != nil {
+			log.Error().Err(err).Msg("failed to read from receiver")
+			return
+		}
+	}
+}
+
+func consumeTrackRemote(track *webrtc.TrackRemote) {
+	for {
+		_, _, err := track.Read(make([]byte, 1500))
+		if err != nil {
+			log.Error().Err(err).Msg("failed to read from track")
+			return
+		}
 	}
 }
 
