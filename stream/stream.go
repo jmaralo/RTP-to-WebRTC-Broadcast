@@ -3,80 +3,53 @@ package stream
 import (
 	"net"
 
-	"github.com/pion/webrtc/v3"
-	"github.com/rs/zerolog/log"
+	"github.com/google/uuid"
+	"github.com/jmaralo/webrtc-broadcast/peer"
 )
 
 type Stream struct {
-	Errors    <-chan error
-	errorChan chan<- error
-
-	stopChan chan struct{}
-
-	track  *webrtc.TrackLocalStaticRTP
-	conn   *net.UDPConn
-	config Config
+	channel *SPMC[[]byte]
+	conn    *net.UDPConn
+	config  Config
 }
 
-func New(conn *net.UDPConn, config Config) (*Stream, error) {
-	log.Info().Str("raddr", conn.LocalAddr().String()).Msg("new stream")
-	track, err := webrtc.NewTrackLocalStaticRTP(config.Codec, config.Id, config.StreamID)
-	if err != nil {
-		return nil, err
-	}
-
-	errorChan := make(chan error, 1)
-
+func New(conn *net.UDPConn, config Config) *Stream {
 	stream := &Stream{
-		Errors:    errorChan,
-		errorChan: errorChan,
-
-		stopChan: make(chan struct{}),
-
-		track:  track,
-		conn:   conn,
-		config: config,
+		channel: NewSPMC[[]byte](config.Channel),
+		conn:    conn,
+		config:  config,
 	}
 
-	go stream.listen(config.Mtu)
+	go stream.run()
 
-	return stream, nil
+	return stream
 }
 
-func (stream *Stream) Track() *webrtc.TrackLocalStaticRTP {
-	return stream.track
+func (stream *Stream) TrackConfig() peer.TrackConfig {
+	return peer.TrackConfig{
+		Codec: stream.config.Codec,
+		ID:    stream.config.Id,
+		Label: stream.config.StreamID,
+	}
 }
 
-func (stream *Stream) listen(mtu int) {
-	log.Debug().Msg("stream listening")
-	defer log.Debug().Msg("stream stopped listening")
-	defer stream.conn.Close()
-
+func (stream *Stream) run() {
+	defer close(stream.channel.Input)
 	for {
-		buffer := make([]byte, mtu)
-		n, err := stream.conn.Read(buffer)
+		readBuf := make([]byte, stream.config.BufferSize)
+		n, err := stream.conn.Read(readBuf)
 		if err != nil {
-			log.Error().Err(err).Msg("failed to read from conn")
-			stream.errorChan <- err
 			return
 		}
 
-		log.Trace().Msg("writing to track")
-		if _, err := stream.track.Write(buffer[:n]); err != nil {
-			log.Error().Err(err).Msg("failed to write to track")
-			stream.errorChan <- err
-			return
-		}
-
-		select {
-		case <-stream.stopChan:
-			log.Trace().Msg("cancel listen received")
-			return
-		default:
-		}
+		stream.channel.Input <- readBuf[:n]
 	}
 }
 
-func (stream *Stream) Stop() {
-	stream.stopChan <- struct{}{}
+func (stream *Stream) Subscribe(bufSize int) (uuid.UUID, <-chan []byte, error) {
+	return stream.channel.AddOutput(bufSize)
+}
+
+func (stream *Stream) Unsubscribe(id uuid.UUID) {
+	stream.channel.RemoveOutput(id)
 }

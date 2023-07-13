@@ -6,11 +6,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/jmaralo/webrtc-broadcast/channel"
 	"github.com/jmaralo/webrtc-broadcast/connection"
 	"github.com/jmaralo/webrtc-broadcast/peer"
@@ -23,28 +24,25 @@ import (
 
 var streamsAddr = flag.String("i", "192.168.0.9:9090,192.168.0.9:9091,192.168.0.9:9092", "comma separated list of RTP streams")
 var localAddr = flag.String("o", "192.168.0.9:4040", "address to listen on")
-var maxPeers = flag.Uint("p", 300, "maximum number of peers")
+var maxPeers = flag.Int("p", 300, "maximum number of peers")
 var logLevel = flag.String("l", "info", "logging level")
 var pingInterval = flag.Duration("ping", time.Second*5, "ping interval")
 var disconnectTimeout = flag.Duration("disconnect", time.Second*10, "disconnect timeout")
 var mtu = flag.Int("mtu", 1500, "MTU")
+var cpuProf = flag.String("profile", "prof", "enable cpu profiling")
 
 func main() {
 	flag.Parse()
 	initLogger()
 
-	manager := connection.NewManager(peer.Config{
-		OfferOptions:  webrtc.OfferOptions{},
-		AnswerOptions: webrtc.AnswerOptions{},
-		Mtu:           *mtu,
-	}, channel.Config{
-		ReadBuffer:        100,
-		WriteBuffer:       100,
-		DataType:          websocket.TextMessage,
-		PingInterval:      *pingInterval,
-		MaxPendingPings:   3,
-		DisconnectTimeout: *disconnectTimeout,
-	}, consumeTrack, int(*maxPeers))
+	if *cpuProf != "" {
+		f, err := os.Create(*cpuProf)
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to create profile file")
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	addrs := strings.Split(*streamsAddr, ",")
 	conns := make([]*net.UDPConn, len(addrs))
@@ -60,25 +58,43 @@ func main() {
 		conns[i] = conn
 	}
 
+	streams := make([]*stream.Stream, len(conns))
 	for i, conn := range conns {
-		stream, err := stream.New(conn, stream.Config{
+		streams[i] = stream.New(conn, stream.Config{
 			Codec: webrtc.RTPCodecCapability{
 				MimeType:  webrtc.MimeTypeH264,
 				ClockRate: 90000,
 			},
-			Id:       fmt.Sprint(i),
-			StreamID: fmt.Sprint(i),
-			Mtu:      *mtu,
+			Id:         fmt.Sprint(i),
+			StreamID:   fmt.Sprint(i),
+			BufferSize: *mtu,
 		})
-		if err != nil {
-			log.Fatal().Err(err).Msg("failed to create stream")
-		}
-		manager.AddStream(stream)
+	}
+
+	manager, err := connection.NewManager(streams, peer.Config{
+		Mtu:     *mtu,
+		OnTrack: consumeTrack,
+	}, channel.Config{
+		ReadBuffer:        100,
+		WriteBuffer:       100,
+		PingInterval:      *pingInterval,
+		MaxPendingPings:   3,
+		DisconnectTimeout: *disconnectTimeout,
+	}, connection.Config{
+		MaxPeers: *maxPeers,
+	})
+
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create connection manager")
 	}
 
 	http.Handle("/", manager)
 	log.Info().Str("addr", *localAddr).Msg("listening")
-	http.ListenAndServe(*localAddr, nil)
+	go http.ListenAndServe(*localAddr, nil)
+
+	inter := make(chan os.Signal, 1)
+	signal.Notify(inter, os.Interrupt)
+	<-inter
 }
 
 func consumeTrack(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {

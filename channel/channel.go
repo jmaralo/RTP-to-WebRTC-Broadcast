@@ -1,67 +1,48 @@
 package channel
 
 import (
-	"sync"
+	"errors"
+	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/rs/zerolog/log"
 )
 
 type Channel struct {
 	Read     <-chan Signal
 	readChan chan<- Signal
 
-	ReadErrors  <-chan error
-	readErrChan chan<- error
-
 	Write     chan<- Signal
 	writeChan <-chan Signal
 
-	WriteErrors  <-chan error
-	writeErrChan chan<- error
+	Errors     <-chan error
+	errorsChan chan<- error
 
 	pollChan chan struct{}
 
-	readCloseChan   chan struct{}
-	writeCloseChan  chan struct{}
-	pollCloseChan   chan struct{}
-	closeChan       chan CloseConfig
-	activeCloseChan chan struct{}
-	closeGroup      *sync.WaitGroup
+	closeChan chan closeConfig
 
 	conn   *websocket.Conn
 	config Config
 }
 
 func New(conn *websocket.Conn, config Config) *Channel {
-	log.Info().Msg("new channel")
 	readChan := make(chan Signal, config.ReadBuffer)
-	readErrChan := make(chan error, 1)
-
 	writeChan := make(chan Signal, config.WriteBuffer)
-	writeErrChan := make(chan error)
+	errorsChan := make(chan error, 5)
 
 	channel := &Channel{
 		Read:     readChan,
 		readChan: readChan,
 
-		ReadErrors:  readErrChan,
-		readErrChan: readErrChan,
-
 		Write:     writeChan,
 		writeChan: writeChan,
 
-		WriteErrors:  writeErrChan,
-		writeErrChan: writeErrChan,
+		Errors:     errorsChan,
+		errorsChan: errorsChan,
 
 		pollChan: make(chan struct{}, config.MaxPendingPings),
 
-		readCloseChan:   make(chan struct{}, 1),
-		writeCloseChan:  make(chan struct{}, 1),
-		pollCloseChan:   make(chan struct{}, 1),
-		closeChan:       make(chan CloseConfig, 1),
-		activeCloseChan: make(chan struct{}, 1),
-		closeGroup:      &sync.WaitGroup{},
+		closeChan: make(chan closeConfig),
 
 		conn:   conn,
 		config: config,
@@ -70,11 +51,94 @@ func New(conn *websocket.Conn, config Config) *Channel {
 	channel.conn.SetPongHandler(channel.onPong)
 	channel.conn.SetCloseHandler(channel.onClose)
 
-	channel.closeGroup.Add(3)
 	go channel.read()
 	go channel.write()
-	go channel.poll()
-	go channel.waitClose()
+	go channel.ping()
+	go channel.close()
 
 	return channel
+}
+
+func (channel *Channel) read() {
+	defer close(channel.readChan)
+	for {
+		var signal Signal
+		err := channel.conn.ReadJSON(&signal)
+		if err != nil {
+			channel.tryClose(websocket.CloseInternalServerErr, err.Error())
+			channel.errorsChan <- err
+			return
+		}
+
+		channel.readChan <- signal
+	}
+}
+
+func (channel *Channel) write() {
+	defer channel.tryClose(websocket.CloseNormalClosure, "no more data to send")
+	for signal := range channel.writeChan {
+		err := channel.conn.WriteJSON(signal)
+		if err != nil {
+			channel.tryClose(websocket.CloseInternalServerErr, err.Error())
+			channel.errorsChan <- err
+			return
+		}
+	}
+}
+
+func (channel *Channel) ping() {
+	ticker := time.NewTicker(channel.config.PingInterval)
+	for range ticker.C {
+		err := channel.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(channel.config.PingInterval))
+		if err != nil {
+			channel.tryClose(websocket.CloseInternalServerErr, err.Error())
+			channel.errorsChan <- err
+			return
+		}
+
+		select {
+		case channel.pollChan <- struct{}{}:
+		default:
+			channel.tryClose(websocket.ClosePolicyViolation, "too many pending pings")
+			channel.errorsChan <- errors.New("too many pending pings")
+			return
+		}
+	}
+}
+
+func (channel *Channel) onPong(appData string) error {
+	for {
+		select {
+		case <-channel.pollChan:
+		default:
+			return nil
+		}
+	}
+}
+
+func (channel *Channel) onClose(code int, text string) error {
+	channel.tryClose(websocket.CloseNormalClosure, "ok")
+	return nil
+}
+
+func (channel *Channel) tryClose(code int, reason string) bool {
+	select {
+	case channel.closeChan <- closeConfig{Code: code, Text: reason}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (channel *Channel) close() {
+	defer channel.conn.Close()
+
+	options := <-channel.closeChan
+
+	deadline := time.Now().Add(channel.config.DisconnectTimeout)
+	message := websocket.FormatCloseMessage(options.Code, options.Text)
+	err := channel.conn.WriteControl(websocket.CloseMessage, message, deadline)
+	if err != nil {
+		channel.errorsChan <- err
+	}
 }

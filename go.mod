@@ -6,7 +6,6 @@ require (
 	github.com/google/uuid v1.3.0
 	github.com/gorilla/websocket v1.5.0
 	github.com/pion/webrtc/v3 v3.1.55
-	github.com/pkg/errors v0.9.1
 	github.com/rs/zerolog v1.29.0
 )
 
@@ -29,6 +28,7 @@ require (
 	github.com/pion/transport/v2 v2.0.1 // indirect
 	github.com/pion/turn/v2 v2.1.0 // indirect
 	github.com/pion/udp v0.1.4 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	golang.org/x/crypto v0.6.0 // indirect
 	golang.org/x/net v0.6.0 // indirect
 	golang.org/x/sys v0.5.0 // indirect
